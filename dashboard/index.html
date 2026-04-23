@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChainGuard AI | GSC Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header panel">
+            <div class="logo">
+                <span class="shield-icon">🛡️</span>
+                <h1>ChainGuard AI</h1>
+            </div>
+            <div class="sdg-badges">
+                <span class="badge sdg-9">SDG 9</span>
+                <span class="badge sdg-12">SDG 12</span>
+                <span class="badge sdg-13">SDG 13</span>
+            </div>
+            <div class="status-indicator">
+                <span class="dot green"></span>
+                <span>SYSTEM NOMINAL</span>
+            </div>
+        </header>
+
+        <div class="main-grid">
+            <!-- Panel A: Live Map -->
+            <section class="map-section panel">
+                <div class="panel-header">
+                    <h2>Live Supply Chain Topology</h2>
+                    <div class="controls">
+                        <button id="inject-disruption-btn" class="btn secondary">Inject Disruption</button>
+                    </div>
+                </div>
+                <div id="map"></div>
+                <div class="map-legend">
+                    <span><i class="dot green"></i> Active</span>
+                    <span><i class="dot yellow"></i> Stressed</span>
+                    <span><i class="dot red"></i> Disrupted</span>
+                </div>
+            </section>
+
+            <!-- Right Column -->
+            <div class="side-column">
+                <!-- Panel B: Safety Shield Log -->
+                <section class="shield-section panel">
+                    <div class="panel-header">
+                        <h2>Safety Shield (Mathematical Masking)</h2>
+                        <span id="violation-count" class="count-badge">Violations: 0</span>
+                    </div>
+                    <div id="shield-log" class="log-container">
+                        <div class="empty-state">No interventions yet. Shield is active.</div>
+                    </div>
+                </section>
+
+                <!-- Panel C: Conformal Uncertainty -->
+                <section class="conformal-section panel">
+                    <div class="panel-header">
+                        <h2>Uncertainty & Escalation</h2>
+                    </div>
+                    <div class="uncertainty-status">
+                        <div class="status-label">Interval Width (MAPIE)</div>
+                        <div class="uncertainty-bar-container">
+                            <div id="uncertainty-bar" class="uncertainty-bar-fill" style="width: 15%;"></div>
+                        </div>
+                        <div id="escalation-status" class="status-text nominal">NOMINAL</div>
+                    </div>
+                </section>
+
+                <!-- Panel D: KG Signal Grounding -->
+                <section class="kg-section panel">
+                    <div class="panel-header">
+                        <h2>Gemini Signal Grounding (SDG 13 Focus)</h2>
+                    </div>
+                    <div id="kg-signal-content" class="kg-content">
+                        <div class="signal-input">
+                            <input type="text" id="signal-text" placeholder="Paste supply chain alert here...">
+                            <button id="resolve-btn" class="btn primary">Resolve</button>
+                        </div>
+                        <div id="kg-results" class="results-container">
+                            <div class="empty-state">Waiting for operational signal...</div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <!-- Google Maps API -->
+    <script async src="https://maps.googleapis.com/maps/api/js?key=YOUR_MAPS_API_KEY&callback=initMap"></script>
+    
+    <!-- Firebase SDKs -->
+    <script src="https://www.gstatic.com/firebasejs/9.x.x/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.x.x/firebase-firestore-compat.js"></script>
+    
+    <script src="app.js"></script>
+</body>
+</html>
