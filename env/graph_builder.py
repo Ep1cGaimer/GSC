@@ -53,6 +53,13 @@ class GraphBuilder:
             self.node_id_to_data[node["id"]] = node
             type_counters[ntype] += 1
 
+        # Pre-compute edge lookups for O(1) access
+        self._edges_from = {}  # node_id -> list of edge dicts
+        self._edges_to = {}    # node_id -> list of edge dicts
+        for edge in self.config.get("edges", []):
+            self._edges_from.setdefault(edge["from"], []).append(edge)
+            self._edges_to.setdefault(edge["to"], []).append(edge)
+
     def build(self, inventory_state: dict = None, disruptions: dict = None) -> HeteroData:
         """Build a HeteroData graph from the topology config.
         
@@ -62,6 +69,7 @@ class GraphBuilder:
                 - 'disabled_edges': list of (from_id, to_id) tuples
                 - 'capacity_multipliers': dict mapping node_id -> multiplier
                 - 'lead_time_multipliers': dict mapping edge key -> multiplier
+                - 'traffic_multipliers': dict mapping road edge key -> multiplier
         
         Returns:
             HeteroData with typed nodes and edges, ready for PyG message passing.
@@ -114,6 +122,7 @@ class GraphBuilder:
 
         edges_by_type = {}  # (src_type, mode, dst_type) -> {"src": [], "dst": [], "attr": []}
         lt_multipliers = disruptions.get("lead_time_multipliers", {})
+        traffic_multipliers = disruptions.get("traffic_multipliers", {})
 
         for edge in self.config["edges"]:
             from_id = edge["from"]
@@ -137,11 +146,12 @@ class GraphBuilder:
             # Edge features: [distance_km, lead_time_days, cost_per_unit, co2_per_km]
             edge_key = f"{from_id}->{to_id}"
             lt_mult = lt_multipliers.get(edge_key, 1.0)
+            traffic_mult = traffic_multipliers.get(edge_key, 1.0) if mode == "road" else 1.0
             edge_attr = [
                 edge["distance_km"] / 1500.0,          # Normalize
-                edge["lead_time_days"] * lt_mult / 5.0, # Normalize
-                edge["cost_per_unit"] / 3.0,             # Normalize
-                edge["co2_per_km"] / 0.15,               # Normalize
+                edge["lead_time_days"] * lt_mult * traffic_mult / 5.0, # Normalize
+                edge["cost_per_unit"] * (1.0 + 0.35 * (traffic_mult - 1.0)) / 3.0, # Normalize
+                edge["co2_per_km"] * (1.0 + 0.15 * (traffic_mult - 1.0)) / 0.15, # Normalize
             ]
             edges_by_type[edge_type_key]["attr"].append(edge_attr)
 
@@ -172,15 +182,15 @@ class GraphBuilder:
 
     def get_edges_from(self, node_id: str) -> list:
         """Get all edges originating from a node."""
-        return [e for e in self.config["edges"] if e["from"] == node_id]
+        return self._edges_from.get(node_id, [])
 
     def get_edges_to(self, node_id: str) -> list:
         """Get all edges going to a node."""
-        return [e for e in self.config["edges"] if e["to"] == node_id]
+        return self._edges_to.get(node_id, [])
 
     def extract_subgraph(self, center_id: str, k_hops: int = 2) -> HeteroData:
         """Extract a k-hop subgraph around a node for decentralized actor input.
-        
+
         Returns a HeteroData containing only nodes within k hops of center_id
         and the edges between them.
         """
@@ -215,6 +225,88 @@ class GraphBuilder:
         sub_builder._index_nodes()
 
         return sub_builder.build()
+
+    def build_homogeneous_subgraph(self, center_id: str, k_hops: int = 2,
+                                    inventory_state: dict = None,
+                                    disruptions: dict = None) -> dict:
+        """Build a homogeneous graph around center_id for the GNN actor.
+
+        All node types share 5 features (capacity/metric, metric2, inventory,
+        lat, lng), so we can treat them as a single node type for message passing.
+
+        Returns:
+            dict with keys:
+                - 'x': node features [num_nodes, 5]
+                - 'edge_index': edge index [2, num_edges]
+                - 'center_idx': index of center_id in x
+                - 'node_ids': list of node ID strings
+                - 'num_nodes': total nodes in subgraph
+        """
+        hetero = self.extract_subgraph(center_id, k_hops)
+        disruptions = disruptions or {}
+        inventory_state = inventory_state or {}
+
+        # Update node features with runtime data
+        for ntype in hetero.node_types:
+            if not hasattr(hetero[ntype], 'node_ids'):
+                continue
+            node_ids = hetero[ntype].node_ids
+            new_features = []
+            for i, nid in enumerate(node_ids):
+                node = self.node_id_to_data.get(nid, {})
+                feature_keys = NODE_FEATURES.get(ntype, ["capacity"])
+                feats = [float(node.get(k, 0.0)) for k in feature_keys]
+                cap_mult = disruptions.get("capacity_multipliers", {}).get(nid, 1.0)
+                feats[0] *= cap_mult
+                inv = float(inventory_state.get(nid, 0.0))
+                feats.extend([inv, node.get("lat", 0) / 90.0,
+                              node.get("lng", 0) / 180.0])
+                while len(feats) < 5:
+                    feats.append(0.0)
+                new_features.append(feats[:5])
+            hetero[ntype].x = torch.tensor(new_features, dtype=torch.float32)
+
+        xs = []
+        node_offsets = {}
+        offset = 0
+        center_idx = None
+
+        for ntype in hetero.node_types:
+            if hasattr(hetero[ntype], 'x') and hetero[ntype].x is not None:
+                xs.append(hetero[ntype].x)
+                node_offsets[ntype] = offset
+                if hasattr(hetero[ntype], 'node_ids'):
+                    for i, nid in enumerate(hetero[ntype].node_ids):
+                        if nid == center_id:
+                            center_idx = offset + i
+                offset += hetero[ntype].x.shape[0]
+
+        x = torch.cat(xs, dim=0)
+
+        edge_parts = []
+        for etype in hetero.edge_types:
+            src_type, _, dst_type = etype
+            if src_type not in node_offsets or dst_type not in node_offsets:
+                continue
+            ei = hetero[etype].edge_index.clone()
+            ei[0] += node_offsets.get(src_type, 0)
+            ei[1] += node_offsets.get(dst_type, 0)
+            edge_parts.append(ei)
+
+        edge_index = torch.cat(edge_parts, dim=1) if edge_parts else torch.zeros((2, 0), dtype=torch.long)
+
+        all_ids = []
+        for ntype in hetero.node_types:
+            if hasattr(hetero[ntype], 'node_ids'):
+                all_ids.extend(hetero[ntype].node_ids)
+
+        return {
+            "x": x,
+            "edge_index": edge_index,
+            "center_idx": center_idx if center_idx is not None else 0,
+            "node_ids": all_ids,
+            "num_nodes": x.shape[0],
+        }
 
     @property
     def num_nodes(self) -> int:

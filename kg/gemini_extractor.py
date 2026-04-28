@@ -1,6 +1,9 @@
 import os
 import json
-import google.generativeai as genai
+import time
+import httpx
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,9 +19,20 @@ class GeminiEntityExtractor:
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("GEMINI_API_KEY must be provided or set as an environment variable.")
-        
-        genai.configure(api_key=self.api_key)
-        self.model = genai.GenerativeModel("gemini-1.5-flash")
+
+        self.timeout_seconds = max(10.0, float(os.getenv("GEMINI_TIMEOUT_SECONDS", "20")))
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.max_retries = max(1, int(os.getenv("GEMINI_MAX_RETRIES", "2")))
+
+        # Ignore broken shell proxy env vars for Gemini API traffic.
+        http_client = httpx.Client(trust_env=False)
+        self.client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(
+                timeout=int(self.timeout_seconds * 1000),
+                httpxClient=http_client,
+            ),
+        )
 
     def extract(self, raw_text: str) -> list[dict]:
         """Extracts entities from raw text.
@@ -43,16 +57,23 @@ class GeminiEntityExtractor:
         JSON:
         """
         
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
-            )
-            entities = json.loads(response.text)
-            return entities
-        except Exception as e:
-            print(f"Error extracting entities with Gemini: {e}")
-            return []
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0,
+                    ),
+                )
+                entities = json.loads(response.text or "[]")
+                return entities
+            except Exception as e:
+                print(f"Error extracting entities with Gemini (attempt {attempt}/{self.max_retries}): {e}")
+                if attempt == self.max_retries:
+                    return []
+                time.sleep(1.5 * attempt)
 
 if __name__ == "__main__":
     # Test

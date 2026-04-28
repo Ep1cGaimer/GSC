@@ -61,19 +61,20 @@ class SafetyShield:
             edges_out: List of outbound edge dicts
             
         Returns:
-            (safe_action, was_intervened, shield_event)
+            (safe_action, was_intervened, shield_event_or_None)
         """
         self.total_checks += 1
         safe_action = action.copy()
         agent_id = agent_state["agent_id"]
         step = agent_state["step"]
+        was_intervened = False
+        last_event = None
 
         # --- Check 1: CO2 Cap ---
         projected_co2 = self._estimate_co2(safe_action, agent_state, edges_in, edges_out)
         total_co2 = agent_state["cumulative_co2"] + projected_co2
 
         if total_co2 > self.co2_cap:
-            # Scale down order quantities proportionally to stay within cap
             remaining_co2 = max(0, self.co2_cap - agent_state["cumulative_co2"])
             if projected_co2 > 0:
                 scale = remaining_co2 / projected_co2
@@ -81,15 +82,15 @@ class SafetyShield:
                 n_orders = len(edges_in)
                 safe_action[:n_orders] *= scale
 
-            event = ShieldEvent(
+            last_event = ShieldEvent(
                 agent_id=agent_id, step=step,
                 reason=f"CO₂ cap exceeded ({total_co2:.0f} > {self.co2_cap:.0f})",
-                original_action=action, safe_action=safe_action,
+                original_action=action, safe_action=safe_action.copy(),
                 constraint_value=total_co2, constraint_limit=self.co2_cap,
             )
-            self.intervention_log.append(event)
+            self.intervention_log.append(last_event)
             self.total_interventions += 1
-            return safe_action, True, event
+            was_intervened = True
 
         # --- Check 2: Budget Cap ---
         projected_cost = self._estimate_cost(safe_action, agent_state, edges_in, edges_out)
@@ -103,15 +104,15 @@ class SafetyShield:
                 n_orders = len(edges_in)
                 safe_action[:n_orders] *= scale
 
-            event = ShieldEvent(
+            last_event = ShieldEvent(
                 agent_id=agent_id, step=step,
                 reason=f"Budget cap exceeded (₹{total_cost:.0f} > ₹{self.budget_cap:.0f})",
-                original_action=action, safe_action=safe_action,
+                original_action=action, safe_action=safe_action.copy(),
                 constraint_value=total_cost, constraint_limit=self.budget_cap,
             )
-            self.intervention_log.append(event)
+            self.intervention_log.append(last_event)
             self.total_interventions += 1
-            return safe_action, True, event
+            was_intervened = True
 
         # --- Check 3: Hazmat Routing ---
         for i, edge in enumerate(edges_out):
@@ -122,32 +123,32 @@ class SafetyShield:
                 if route_idx < len(safe_action) and safe_action[route_idx] > 0.0:
                     safe_action[route_idx] = 0.0  # Block this route
 
-                    event = ShieldEvent(
+                    last_event = ShieldEvent(
                         agent_id=agent_id, step=step,
                         reason=f"Hazmat zone routing blocked ({dest_id})",
-                        original_action=action, safe_action=safe_action,
+                        original_action=action, safe_action=safe_action.copy(),
                         constraint_value=1.0, constraint_limit=0.0,
                     )
-                    self.intervention_log.append(event)
+                    self.intervention_log.append(last_event)
                     self.total_interventions += 1
-                    return safe_action, True, event
+                    was_intervened = True
 
         # --- Check 4: Over-ordering (prevent drain) ---
         for i, edge in enumerate(edges_in):
             if i < len(safe_action) and safe_action[i] > self.max_order_fraction:
                 safe_action[i] = self.max_order_fraction
 
-                event = ShieldEvent(
+                last_event = ShieldEvent(
                     agent_id=agent_id, step=step,
                     reason=f"Over-ordering capped at {self.max_order_fraction:.0%}",
-                    original_action=action, safe_action=safe_action,
+                    original_action=action, safe_action=safe_action.copy(),
                     constraint_value=float(action[i]), constraint_limit=self.max_order_fraction,
                 )
-                self.intervention_log.append(event)
+                self.intervention_log.append(last_event)
                 self.total_interventions += 1
-                return safe_action, True, event
+                was_intervened = True
 
-        return safe_action, False, None
+        return safe_action, was_intervened, last_event
 
     def _estimate_co2(self, action: np.ndarray, agent_state: dict,
                       edges_in: list, edges_out: list) -> float:

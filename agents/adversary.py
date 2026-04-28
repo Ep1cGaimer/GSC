@@ -9,7 +9,8 @@ and forces discovery of targeted vulnerabilities.
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as F
+from torch.distributions import Beta
 import numpy as np
 
 
@@ -40,34 +41,32 @@ class AdversaryPolicy(nn.Module):
 
         self.encoder = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
         )
 
-        self.mean_head = nn.Linear(hidden_dim, self.action_dim)
-        self.log_std = nn.Parameter(torch.zeros(self.action_dim) - 1.0)
+        self.alpha_head = nn.Linear(hidden_dim, self.action_dim)
+        self.beta_head = nn.Linear(hidden_dim, self.action_dim)
 
     def forward(self, obs: torch.Tensor):
         """Generate perturbation parameters."""
         h = self.encoder(obs)
-        mean = torch.sigmoid(self.mean_head(h))  # Raw [0, 1]
-        log_std = self.log_std.expand_as(mean)
-        return mean, log_std
+        alpha = F.softplus(self.alpha_head(h)) + 1.0
+        beta = F.softplus(self.beta_head(h)) + 1.0
+        return alpha, beta
 
-    def get_disruption(self, obs: torch.Tensor,
-                       retailer_ids: list, edge_keys: list,
-                       node_ids: list) -> dict:
-        """Generate a disruption dict compatible with SupplyChainEnv.inject_disruption().
+    def action_to_disruption(self, action: torch.Tensor,
+                             retailer_ids: list, edge_keys: list,
+                             node_ids: list) -> dict:
+        """Convert a raw action tensor into a disruption dict.
         
-        Applies disruption budget: total perturbation magnitude capped.
+        This method does NOT resample — it uses the exact action passed in,
+        ensuring the gradient flows through the correct action.
         """
-        with torch.no_grad():
-            mean, log_std = self.forward(obs)
-            std = log_std.exp()
-            dist = Normal(mean, std)
-            raw_action = dist.sample()
-            raw_action = torch.clamp(raw_action, 0.0, 1.0).numpy().flatten()
+        raw_action = action.detach().cpu().numpy().flatten()
 
         # Split into perturbation types
         demand_raw = raw_action[:self.num_demand]
@@ -75,10 +74,9 @@ class AdversaryPolicy(nn.Module):
         capacity_raw = raw_action[self.num_demand + self.num_edges:]
 
         # Compute disruption cost for budget constraint
-        # Each perturbation type has a "cost" proportional to severity
-        demand_costs = np.abs(demand_raw - 0.5) * 2  # Deviation from neutral
-        edge_costs = (edge_raw > 0.5).astype(float) * 1.5  # Disabling an edge costs more
-        capacity_costs = (1.0 - capacity_raw) * 1.0  # Reducing capacity
+        demand_costs = np.abs(demand_raw - 0.5) * 2
+        edge_costs = (edge_raw > 0.5).astype(float) * 1.5
+        capacity_costs = (1.0 - capacity_raw) * 1.0
 
         total_cost = demand_costs.sum() + edge_costs.sum() + capacity_costs.sum()
 
@@ -97,37 +95,36 @@ class AdversaryPolicy(nn.Module):
             "lead_time_multipliers": {},
         }
 
-        # Demand multipliers: map [0, 1] → [0.5, 2.0]
         for i, rid in enumerate(retailer_ids[:self.num_demand]):
             mult = 0.5 + demand_raw[i] * 1.5  # [0.5, 2.0]
-            if abs(mult - 1.0) > 0.1:  # Only apply non-trivial perturbations
+            if abs(mult - 1.0) > 0.1:
                 disruption["demand_multipliers"][rid] = float(mult)
 
-        # Edge disabling: threshold at 0.5
         for i, ekey in enumerate(edge_keys[:self.num_edges]):
             if edge_raw[i] > 0.5:
                 parts = ekey.split("->")
                 if len(parts) == 2:
                     disruption["disabled_edges"].append(parts)
 
-        # Capacity multipliers: map [0, 1] → [0.3, 1.0]
         for i, nid in enumerate(node_ids[:self.num_capacity]):
             mult = 0.3 + capacity_raw[i] * 0.7  # [0.3, 1.0]
-            if mult < 0.9:  # Only apply meaningful reductions
+            if mult < 0.9:
                 disruption["capacity_multipliers"][nid] = float(mult)
 
         return disruption
 
-    def get_action_and_logprob(self, obs: torch.Tensor, action=None):
+    def get_action_and_logprob(self, obs: torch.Tensor, action=None, deterministic: bool = False):
         """For training: get action and log probability."""
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        dist = Normal(mean, std)
+        alpha, beta = self.forward(obs)
+        dist = Beta(alpha, beta)
 
         if action is None:
-            action = dist.sample()
-            action = torch.clamp(action, 0.0, 1.0)
+            if deterministic:
+                action = alpha / (alpha + beta)
+            else:
+                action = dist.rsample()
 
+        action = torch.clamp(action, 1e-6, 1.0 - 1e-6)
         log_prob = dist.log_prob(action).sum(-1)
         entropy = dist.entropy().sum(-1)
         return action, log_prob, entropy

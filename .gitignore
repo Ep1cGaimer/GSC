@@ -182,3 +182,14 @@ Thumbs.db
 models/
 runs/
 logs/
+
+# Frontend local artifacts
+node_modules/
+dashboard/node_modules/
+.playwright-cli/
+
+# Dashboard build
+dashboard/dist/
+
+# Claude CLI
+.claude/

@@ -34,12 +34,21 @@ class SupplyChainEnv(ParallelEnv):
         "is_parallelizable": True,
     }
 
-    def __init__(self, topology_config: str, max_steps: int = 100, seed: int = 42):
+    def __init__(
+        self,
+        topology_config: str,
+        max_steps: int = 100,
+        seed: int = 42,
+        traffic_enabled: bool = True,
+        stochastic_traffic: bool = True,
+    ):
         super().__init__()
         self.graph_builder = GraphBuilder(topology_config)
         self.max_steps = max_steps
         self._seed = seed
         self.rng = np.random.RandomState(seed)
+        self.traffic_enabled = traffic_enabled
+        self.stochastic_traffic = stochastic_traffic
 
         # Agents are warehouse nodes
         self.possible_agents = self.graph_builder.get_all_agent_ids()
@@ -66,6 +75,13 @@ class SupplyChainEnv(ParallelEnv):
         self.current_step = 0
         self.disruptions = {}
 
+        # In-transit shipments: {(from, to): {"units": float, "steps_remaining": int}}
+        self.in_transit = {}
+        # Track what happened in each step for animation playback
+        self.flow_history = []
+        # Flow data for the last step (inbound/outbound shipments)
+        self.last_step_flows = {"inbound": [], "outbound": [], "deliveries": []}
+
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
         """Observation space per agent.
@@ -79,7 +95,9 @@ class SupplyChainEnv(ParallelEnv):
         - outbound_route_status (max_outbound) — 1.0 if route active, 0.0 if disrupted
         - time_remaining_normalized (1)
         """
-        obs_size = 4 + self._max_inbound + self._max_outbound + 1
+        # The second outbound block is the route traffic pressure. This makes
+        # congestion visible to the policy instead of only affecting the UI.
+        obs_size = 4 + self._max_inbound + self._max_outbound + self._max_outbound + 1
         return spaces.Box(low=-np.inf, high=np.inf, shape=(obs_size,), dtype=np.float32)
 
     @functools.lru_cache(maxsize=None)
@@ -97,7 +115,10 @@ class SupplyChainEnv(ParallelEnv):
         """Reset environment to initial state."""
         if seed is not None:
             self._seed = seed
-        self.rng = np.random.RandomState(self._seed)
+            self.rng = np.random.RandomState(self._seed)
+        elif not hasattr(self, 'rng'):
+            self.rng = np.random.RandomState(self._seed)
+        
         self.agents = list(self.possible_agents)
         self.current_step = 0
 
@@ -122,7 +143,17 @@ class SupplyChainEnv(ParallelEnv):
             "disabled_edges": [],
             "capacity_multipliers": {},
             "lead_time_multipliers": {},
+            "demand_multipliers": {},
+            "traffic_multipliers": {},
         }
+
+        # Reset in-transit shipments and flow tracking
+        self.in_transit = {}
+        self.flow_history = []
+        self.last_step_flows = {"inbound": [], "outbound": [], "deliveries": []}
+
+        if self.traffic_enabled and self.stochastic_traffic:
+            self._refresh_stochastic_traffic()
 
         observations = {agent: self._get_obs(agent) for agent in self.agents}
         infos = {agent: self._get_info(agent) for agent in self.agents}
@@ -142,8 +173,34 @@ class SupplyChainEnv(ParallelEnv):
         rewards = {}
         terminations = {}
         truncations = {}
+        infos = {}
 
-        # Generate demand for this timestep
+        # Initialize flow tracking for this step
+        step_inbound = []
+        step_outbound = []
+        step_deliveries = []
+
+        # Process deliveries first: items that have arrived from in_transit
+        delivered_keys = []
+        for edge_key, transit_data in list(self.in_transit.items()):
+            if transit_data["steps_remaining"] <= 0:
+                # Deliver the goods to the destination
+                dest_id = edge_key[1]
+                units = transit_data["units"]
+                if units > 0 and dest_id in self.inventory:
+                    self.inventory[dest_id] += units
+                    step_deliveries.append({
+                        "from": edge_key[0],
+                        "to": dest_id,
+                        "units": round(units, 1)
+                    })
+                delivered_keys.append(edge_key)
+
+        # Remove delivered items from in_transit
+        for key in delivered_keys:
+            del self.in_transit[key]
+
+        # Generate demand for this timestep using the traffic state the agent observed.
         current_demands = self._generate_demands()
 
         for agent_id in self.agents:
@@ -153,22 +210,33 @@ class SupplyChainEnv(ParallelEnv):
 
             inbound_edges = self.graph_builder.get_edges_to(agent_id)
             outbound_edges = self.graph_builder.get_edges_from(agent_id)
+            node_data = self.graph_builder.get_node_data(agent_id)
+            warehouse_capacity = float(node_data.get("capacity", 1000.0))
 
             # Parse action
-            order_quantities = action[:self._max_inbound]
-            route_allocations = action[self._max_inbound:]
+            order_quantities = np.clip(action[:self._max_inbound], 0.0, 1.0)
+            route_allocations = np.clip(action[self._max_inbound:], 0.0, 1.0)
+            active_route_allocations = route_allocations[:len(outbound_edges)].astype(np.float32, copy=True)
+            alloc_sum = float(active_route_allocations.sum())
+            if alloc_sum > 1.0:
+                active_route_allocations /= alloc_sum
 
-            # --- Process inbound orders ---
+            # --- Process inbound orders (add to in_transit, don't arrive instantly) ---
             total_order_cost = 0.0
             total_order_co2 = 0.0
-            total_incoming = 0.0
+            total_ordered = 0.0
+
+            # Build disabled edges set once
+            disabled_edges = set()
+            for d in self.disruptions.get("disabled_edges", []):
+                disabled_edges.add((d[0], d[1]))
 
             for i, edge in enumerate(inbound_edges):
                 if i >= len(order_quantities):
                     break
                 # Check if edge is disabled by disruption
                 edge_key = (edge["from"], edge["to"])
-                if edge_key in [(d[0], d[1]) for d in self.disruptions.get("disabled_edges", [])]:
+                if edge_key in disabled_edges:
                     continue
 
                 # Normalized order quantity * source capacity
@@ -178,44 +246,97 @@ class SupplyChainEnv(ParallelEnv):
                 available = src_capacity * cap_mult
 
                 order_qty = float(order_quantities[i]) * available
-                order_cost = order_qty * edge["cost_per_unit"]
-                order_co2 = order_qty * edge["distance_km"] * edge["co2_per_km"]
+                metrics = self._effective_edge_metrics(edge)
+                order_cost = order_qty * metrics["cost_per_unit"]
+                order_co2 = order_qty * metrics["distance_km"] * metrics["co2_per_km"]
 
-                total_incoming += order_qty
+                total_ordered += order_qty
                 total_order_cost += order_cost
                 total_order_co2 += order_co2
 
-            # Update inventory
-            self.inventory[agent_id] += total_incoming
+                # Add to in_transit with lead_time_days as steps_remaining
+                if order_qty > 0:
+                    lead_time = max(1, int(edge.get("lead_time_days", 1)))
+                    if edge_key in self.in_transit:
+                        self.in_transit[edge_key]["units"] += order_qty
+                        self.in_transit[edge_key]["steps_remaining"] = max(
+                            self.in_transit[edge_key]["steps_remaining"], lead_time
+                        )
+                    else:
+                        self.in_transit[edge_key] = {
+                            "units": order_qty,
+                            "steps_remaining": lead_time
+                        }
+                    step_inbound.append({
+                        "from": edge["from"],
+                        "to": agent_id,
+                        "units": round(order_qty, 1),
+                        "mode": edge.get("mode", "road")
+                    })
+
+            # Note: inventory is NOT updated here - goods are in transit
+            # They will be added to inventory when steps_remaining reaches 0
 
             # --- Process outbound fulfillment ---
+            # Compute all allocations from a snapshot of inventory
             total_fulfilled = 0.0
             total_fulfill_cost = 0.0
             total_fulfill_co2 = 0.0
 
+            # First pass: compute desired fulfillment for each route
+            route_fulfills = []
+            available_inventory = self.inventory[agent_id]
+            total_desired = 0.0
+
             for i, edge in enumerate(outbound_edges):
-                if i >= len(route_allocations):
+                if i >= len(active_route_allocations):
                     break
                 edge_key = (edge["from"], edge["to"])
-                if edge_key in [(d[0], d[1]) for d in self.disruptions.get("disabled_edges", [])]:
+                if edge_key in disabled_edges:
+                    route_fulfills.append(0.0)
                     continue
 
                 dest_id = edge["to"]
                 demand = current_demands.get(dest_id, 0.0)
+                desired = float(active_route_allocations[i]) * demand
+                route_fulfills.append(desired)
+                total_desired += desired
 
-                # Allocate from inventory based on route allocation fraction
-                allocated = float(route_allocations[i]) * min(demand, self.inventory[agent_id])
-                fulfilled = min(allocated, self.inventory[agent_id])
+            # Scale down if total desired exceeds available inventory
+            if total_desired > available_inventory and total_desired > 0:
+                scale = available_inventory / total_desired
+                route_fulfills = [r * scale for r in route_fulfills]
+
+            # Second pass: apply fulfillment
+            for i, edge in enumerate(outbound_edges):
+                if i >= len(route_fulfills):
+                    break
+                fulfilled = route_fulfills[i]
+                if fulfilled <= 0:
+                    continue
 
                 self.inventory[agent_id] -= fulfilled
                 total_fulfilled += fulfilled
-                total_fulfill_cost += fulfilled * edge["cost_per_unit"]
-                total_fulfill_co2 += fulfilled * edge["distance_km"] * edge["co2_per_km"]
+                metrics = self._effective_edge_metrics(edge)
+                total_fulfill_cost += fulfilled * metrics["cost_per_unit"]
+                total_fulfill_co2 += fulfilled * metrics["distance_km"] * metrics["co2_per_km"]
+
+                step_outbound.append({
+                    "from": agent_id,
+                    "to": edge["to"],
+                    "units": round(fulfilled, 1),
+                    "mode": edge.get("mode", "road")
+                })
 
             # --- Compute costs ---
-            node_data = self.graph_builder.get_node_data(agent_id)
             storage_cost = self.inventory[agent_id] * node_data.get("storage_cost", 0.5) * 0.01
-            total_cost = total_order_cost + total_fulfill_cost + storage_cost
+            # Add holding cost for goods in transit targeting this warehouse
+            in_transit_to_agent = sum(
+                v["units"] for k, v in self.in_transit.items() if k[1] == agent_id
+            )
+            holding_cost = in_transit_to_agent * node_data.get("storage_cost", 0.5) * 0.005
+            overflow_penalty = 0.0  # Simplified - no overflow for now
+            total_cost = total_order_cost + total_fulfill_cost + storage_cost + holding_cost + overflow_penalty
             total_co2 = total_order_co2 + total_fulfill_co2
 
             self.cumulative_cost[agent_id] += total_cost
@@ -239,6 +360,37 @@ class SupplyChainEnv(ParallelEnv):
 
             # Track demand for info
             self.demand_history[agent_id].append(total_demand)
+            infos[agent_id] = {
+                **self._get_info(agent_id),
+                "incoming_units": 0,  # No instant incoming - goods are in transit
+                "in_transit_incoming": round(in_transit_to_agent, 1),
+                "fulfilled_units": total_fulfilled,
+                "demand_units": total_demand,
+                "unfulfilled_units": unfulfilled,
+                "overflow_units": 0,
+                "overflow_penalty": 0,
+                "stockout_penalty": stockout_penalty,
+                "storage_cost": storage_cost,
+                "holding_cost": holding_cost,
+                "step_cost": total_cost,
+                "step_co2": total_co2,
+                "step_revenue": revenue,
+            }
+
+        # Decrement steps_remaining for all in-transit items
+        for edge_key in self.in_transit:
+            self.in_transit[edge_key]["steps_remaining"] -= 1
+
+        # Store flow data for this step
+        self.last_step_flows = {
+            "inbound": step_inbound,
+            "outbound": step_outbound,
+            "deliveries": step_deliveries
+        }
+        self.flow_history.append(self.last_step_flows)
+        # Keep only last 50 steps in history
+        if len(self.flow_history) > 50:
+            self.flow_history = self.flow_history[-50:]
 
         # Check termination
         done = self.current_step >= self.max_steps
@@ -246,8 +398,12 @@ class SupplyChainEnv(ParallelEnv):
             terminations[agent_id] = done
             truncations[agent_id] = False
 
+        if not done and self.traffic_enabled and self.stochastic_traffic:
+            self._refresh_stochastic_traffic()
+
         observations = {agent: self._get_obs(agent) for agent in self.agents}
-        infos = {agent: self._get_info(agent) for agent in self.agents}
+        for agent in self.agents:
+            infos.setdefault(agent, self._get_info(agent))
 
         if done:
             self.agents = []
@@ -272,9 +428,9 @@ class SupplyChainEnv(ParallelEnv):
 
         features = [
             self.inventory[agent_id] / 5000.0,                      # Normalized inventory
-            self.cumulative_cost[agent_id] / 100000.0,               # Normalized cost
-            self.cumulative_co2[agent_id] / 10000.0,                 # Normalized CO2
-            float(self.current_step) / float(self.max_steps),        # Time remaining
+            self.cumulative_cost[agent_id] / 1e6,                   # Normalized cost
+            self.cumulative_co2[agent_id] / 2e7,                    # Normalized CO2
+            self._get_expected_demand_pressure(agent_id),           # Demand pressure
         ]
 
         # Inbound supply availability (padded to max_inbound)
@@ -300,6 +456,18 @@ class SupplyChainEnv(ParallelEnv):
             else:
                 features.append(0.0)
 
+        # Outbound traffic pressure (1.0 normal, >1.0 congested), padded.
+        traffic = self.disruptions.get("traffic_multipliers", {})
+        for i in range(self._max_outbound):
+            if i < len(outbound_edges):
+                edge = outbound_edges[i]
+                if edge.get("mode") == "road":
+                    features.append(float(traffic.get(self._edge_key(edge), 1.0)) / 3.0)
+                else:
+                    features.append(1.0 / 3.0)
+            else:
+                features.append(0.0)
+
         # Time remaining
         features.append(1.0 - self.current_step / self.max_steps)
 
@@ -316,6 +484,32 @@ class SupplyChainEnv(ParallelEnv):
             "step": self.current_step,
             "max_steps": self.max_steps,
         }
+
+    def get_action_mask(self, agent_id: str, obs_vec: np.ndarray | None = None) -> np.ndarray:
+        """Binary mask for valid action dimensions based on the current observation layout."""
+        if obs_vec is None:
+            obs_vec = self._get_obs(agent_id)
+
+        in_start = 4
+        in_end = 4 + self._max_inbound
+        out_start = in_end
+        out_end = in_end + self._max_outbound
+
+        in_mask = (obs_vec[in_start:in_end] > 0).astype(np.float32)
+        out_mask = (obs_vec[out_start:out_end] > 0).astype(np.float32)
+        return np.concatenate([in_mask, out_mask], axis=0)
+
+    def _get_expected_demand_pressure(self, agent_id: str) -> float:
+        """Expected downstream demand for this warehouse based on connected retailers."""
+        pressure = 0.0
+        demand_mults = self.disruptions.get("demand_multipliers", {})
+        for edge in self.graph_builder.get_edges_from(agent_id):
+            dest = self.graph_builder.get_node_data(edge["to"])
+            if dest.get("type") != "retailer":
+                continue
+            base_demand = float(dest.get("demand_mean", 100.0))
+            pressure += base_demand * float(demand_mults.get(dest["id"], 1.0))
+        return pressure / 1000.0
 
     def inject_disruption(self, disruption: dict):
         """Inject a disruption into the environment (used by adversary agent).
@@ -342,6 +536,8 @@ class SupplyChainEnv(ParallelEnv):
             "disabled_edges": [],
             "capacity_multipliers": {},
             "lead_time_multipliers": {},
+            "demand_multipliers": {},
+            "traffic_multipliers": {},
         }
 
     def get_graph_state(self) -> dict:
@@ -354,3 +550,95 @@ class SupplyChainEnv(ParallelEnv):
             "inventory": dict(self.inventory),
             "disruptions": dict(self.disruptions),
         }
+
+    def get_graph_obs(self, agent_id: str) -> dict:
+        """Get a homogeneous subgraph observation for a single agent."""
+        return self.graph_builder.build_homogeneous_subgraph(
+            center_id=agent_id,
+            k_hops=2,
+            inventory_state=self.inventory,
+            disruptions=self.disruptions,
+        )
+
+    def get_all_graph_obs(self) -> list:
+        """Get homogeneous subgraph observations for all warehouse agents."""
+        return [self.get_graph_obs(a) for a in self.agents]
+
+    def update_traffic(self, traffic_multipliers: dict):
+        """Update live road traffic multipliers from Maps observations.
+
+        Keys are "FROM->TO" edge ids. Values are duration_in_traffic/base_duration
+        clamped to a sane range so a bad API response cannot dominate rewards.
+        """
+        if not self.traffic_enabled:
+            return
+        current = self.disruptions.setdefault("traffic_multipliers", {})
+        valid_edges = {self._edge_key(edge) for edge in self.graph_builder.config.get("edges", [])}
+        for key, value in traffic_multipliers.items():
+            if key not in valid_edges:
+                continue
+            try:
+                current[key] = float(np.clip(float(value), 0.75, 3.0))
+            except (TypeError, ValueError):
+                continue
+
+    def _edge_key(self, edge: dict) -> str:
+        return f"{edge['from']}->{edge['to']}"
+
+    def _effective_edge_metrics(self, edge: dict) -> dict:
+        metrics = dict(edge)
+        key = self._edge_key(edge)
+        lead_mult = self.disruptions.get("lead_time_multipliers", {}).get(key, 1.0)
+        traffic_mult = self.disruptions.get("traffic_multipliers", {}).get(key, 1.0)
+        if edge.get("mode") != "road":
+            traffic_mult = 1.0
+
+        metrics["lead_time_days"] = float(edge.get("lead_time_days", 0.0)) * float(lead_mult) * float(traffic_mult)
+        # Congestion mostly affects operating cost; CO2 rises more gently.
+        metrics["cost_per_unit"] = float(edge.get("cost_per_unit", 0.0)) * (1.0 + 0.35 * (float(traffic_mult) - 1.0))
+        metrics["co2_per_km"] = float(edge.get("co2_per_km", 0.0)) * (1.0 + 0.15 * (float(traffic_mult) - 1.0))
+        return metrics
+
+    def _refresh_stochastic_traffic(self):
+        traffic = {}
+        for edge in self.graph_builder.config.get("edges", []):
+            if edge.get("mode") != "road":
+                continue
+            # Most roads are normal; some become moderately/heavily congested.
+            draw = self.rng.lognormal(mean=0.0, sigma=0.22)
+            traffic[self._edge_key(edge)] = float(np.clip(draw, 0.85, 2.2))
+        self.disruptions["traffic_multipliers"] = traffic
+
+    def get_shipment_state(self) -> dict:
+        """Get current in-transit shipments for animation.
+        
+        Returns:
+            dict mapping edge keys to shipment data with units and steps remaining.
+        """
+        result = {}
+        for edge_key, data in self.in_transit.items():
+            key = f"{edge_key[0]}->{edge_key[1]}"
+            result[key] = {
+                "from": edge_key[0],
+                "to": edge_key[1],
+                "units": round(data["units"], 1),
+                "steps_remaining": data["steps_remaining"],
+                "total_steps": data.get("total_steps", 1)
+            }
+        return result
+
+    def get_step_flows(self) -> dict:
+        """Get what moved in the last step for animation playback.
+        
+        Returns:
+            dict with inbound, outbound, and deliveries from last step.
+        """
+        return self.last_step_flows
+
+    def get_all_flows(self) -> list:
+        """Get the complete flow history for replay or animation.
+        
+        Returns:
+            list of step flow dictionaries.
+        """
+        return self.flow_history

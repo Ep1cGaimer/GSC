@@ -1,0 +1,92 @@
+{
+  "baseline": {
+    "Random": {
+      "total_revenue_mean": 467868.23831206356,
+      "total_revenue_std": 3310.4004576171824,
+      "total_cost_mean": 9041662.737497902,
+      "total_cost_std": 119780.10131888746,
+      "total_co2_mean": 136406939.66677007,
+      "total_co2_std": 1668399.772660917,
+      "fill_rate_mean": 0.2901747973350781,
+      "fill_rate_std": 0.0013457666824260182,
+      "gross_margin_mean": -8573794.49918584,
+      "gross_margin_std": 118383.86195118517,
+      "total_unfulfilled_mean": 228898.884145917,
+      "total_unfulfilled_std": 1135.4579510655662
+    },
+    "BaseStock": {
+      "total_revenue_mean": 389792.48217416415,
+      "total_revenue_std": 2179.8595283279305,
+      "total_cost_mean": 97000.18718767946,
+      "total_cost_std": 661.2437691068485,
+      "total_co2_mean": 3700971.5521954847,
+      "total_co2_std": 34697.229123539466,
+      "fill_rate_mean": 0.24175417016866776,
+      "fill_rate_std": 0.0011600699933526323,
+      "gross_margin_mean": 292792.2949864847,
+      "gross_margin_std": 1528.0182008756608,
+      "total_unfulfilled_mean": 244514.03537349682,
+      "total_unfulfilled_std": 1346.0457703575116
+    }
+  },
+  "mild_stress": {
+    "Random": {
+      "total_revenue_mean": 476911.9370381235,
+      "total_revenue_std": 4078.714094559716,
+      "total_cost_mean": 9039607.586620793,
+      "total_cost_std": 119558.09194488394,
+      "total_co2_mean": 136441000.46418387,
+      "total_co2_std": 1668660.502820893,
+      "fill_rate_mean": 0.282635384894719,
+      "fill_rate_std": 0.0017174059365810612,
+      "gross_margin_mean": -8562695.64958267,
+      "gross_margin_std": 117217.97209008654,
+      "total_unfulfilled_mean": 242090.14440070503,
+      "total_unfulfilled_std": 1109.7131502687357
+    },
+    "BaseStock": {
+      "total_revenue_mean": 366546.7421711378,
+      "total_revenue_std": 2104.4446961377025,
+      "total_cost_mean": 94053.14263161006,
+      "total_cost_std": 646.6992331790067,
+      "total_co2_mean": 3661400.1571702575,
+      "total_co2_std": 34547.842132145866,
+      "fill_rate_mean": 0.2172321449291894,
+      "fill_rate_std": 0.0011151615055988767,
+      "gross_margin_mean": 272493.5995395278,
+      "gross_margin_std": 1473.9678166453266,
+      "total_unfulfilled_mean": 264163.18337410217,
+      "total_unfulfilled_std": 1379.0982898288423
+    }
+  },
+  "severe_stress": {
+    "Random": {
+      "total_revenue_mean": 516178.6187494638,
+      "total_revenue_std": 3994.7051555679527,
+      "total_cost_mean": 8180327.39226518,
+      "total_cost_std": 106561.9586540016,
+      "total_co2_mean": 133425201.60785803,
+      "total_co2_std": 1722222.3003082396,
+      "fill_rate_mean": 0.2734911978109133,
+      "fill_rate_std": 0.0016604896001200786,
+      "gross_margin_mean": -7664148.773515718,
+      "gross_margin_std": 104655.15304094736,
+      "total_unfulfilled_mean": 274236.8080584369,
+      "total_unfulfilled_std": 1221.7936858938833
+    },
+    "BaseStock": {
+      "total_revenue_mean": 346911.1778878632,
+      "total_revenue_std": 2131.727733134684,
+      "total_cost_mean": 92005.83373875674,
+      "total_cost_std": 658.700987031469,
+      "total_co2_mean": 3593271.1462675794,
+      "total_co2_std": 34360.66804558783,
+      "fill_rate_mean": 0.18380783340082232,
+      "fill_rate_std": 0.0009332110353967596,
+      "gross_margin_mean": 254905.34414910647,
+      "gross_margin_std": 1482.6942403947412,
+      "total_unfulfilled_mean": 308090.296230757,
+      "total_unfulfilled_std": 1355.712459828213
+    }
+  }
+}

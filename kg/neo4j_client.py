@@ -18,7 +18,11 @@ class KnowledgeGraphClient:
         if not self.password:
             print("WARNING: NEO4J_PASSWORD not set. Connection may fail.")
 
-        self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
+        self.driver = GraphDatabase.driver(
+            self.uri,
+            auth=(self.user, self.password),
+            connection_timeout=3,
+        )
 
     def close(self):
         self.driver.close()

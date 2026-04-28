@@ -10,7 +10,8 @@ the same weights process 40, 50, or 75 node graphs without retraining.
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as F
+from torch.distributions import Beta
 from torch_geometric.nn import GATConv, HeteroConv, global_mean_pool
 from torch_geometric.data import HeteroData, Batch
 
@@ -95,21 +96,22 @@ class HeteroGNNCritic(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Store dynamically built convs
-        self._conv_cache = {}
+        # Store dynamically built convs — use ModuleDict so parameters are tracked
+        self._conv_cache = nn.ModuleDict()
 
     def _get_conv(self, edge_types, device):
         """Build or retrieve cached HeteroConv for given edge types."""
-        key = tuple(sorted(edge_types))
-        if key not in self._conv_cache:
+        # Use a stable string key for nn.ModuleDict compatibility
+        str_key = "|".join(f"{s}__{r}__{d}" for s, r, d in sorted(edge_types))
+        if str_key not in self._conv_cache:
             conv_dict = {}
             for et in edge_types:
                 conv_dict[et] = GATConv(
                     self.hidden_channels, self.hidden_channels,
                     heads=self.heads, concat=False
                 ).to(device)
-            self._conv_cache[key] = HeteroConv(conv_dict, aggr="mean")
-        return self._conv_cache[key]
+            self._conv_cache[str_key] = HeteroConv(conv_dict, aggr="mean")
+        return self._conv_cache[str_key]
 
     def forward(self, data: HeteroData) -> torch.Tensor:
         """
@@ -152,57 +154,112 @@ class HeteroGNNCritic(nn.Module):
 
 
 class GNNActor(nn.Module):
-    """Decentralized actor using GNN encoder on local subgraph.
-    
-    Used during both training and inference.
-    Outputs a continuous action distribution (mean + log_std).
+    """Actor with optional GNN encoder on local subgraph.
+
+    Two modes:
+      - Flat: MLP encoder on flat observation vector (backward compatible)
+      - Graph: GNNEncoder on homogeneous k-hop subgraph around agent
+
+    Set use_graph=True and pass graph_obs dict to use GNN path.
     """
 
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64,
-                 embed_dim: int = 128, gnn_heads: int = 4):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128,
+                 embed_dim: int = 128, gnn_heads: int = 4, use_graph: bool = False):
         super().__init__()
-        # Observation encoder (for flat observations from env)
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, embed_dim),
-            nn.ReLU(),
-        )
+        self.use_graph = use_graph
 
-        # Policy head
-        self.mean_head = nn.Sequential(
+        if use_graph:
+            self.gnn_encoder = GNNEncoder(
+                in_channels=5, hidden_channels=hidden_dim,
+                out_channels=embed_dim, heads=gnn_heads
+            )
+            self.obs_encoder = None
+        else:
+            self.obs_encoder = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.Tanh(),
+            )
+            self.gnn_encoder = None
+
+        self.alpha_head = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
-            nn.Sigmoid(),  # Actions in [0, 1]
+        )
+        self.beta_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, action_dim),
         )
 
-        self.log_std = nn.Parameter(torch.zeros(action_dim) - 0.5)
-
-    def forward(self, obs: torch.Tensor):
+    def forward(self, obs, graph_obs=None):
         """
         Args:
-            obs: Flat observation tensor [batch, obs_dim]
+            obs: Flat observation tensor [batch, obs_dim] (ignored if use_graph)
+            graph_obs: For graph mode: dict with 'x', 'edge_index', 'center_idx'
+                       or list of such dicts for batched agents
         Returns:
-            action_mean, action_log_std
+            alpha, beta
         """
-        embedding = self.obs_encoder(obs)
-        mean = self.mean_head(embedding)
-        log_std = self.log_std.expand_as(mean)
-        return mean, log_std
+        if self.use_graph and graph_obs is not None:
+            if isinstance(graph_obs, list):
+                embeddings = []
+                for go in graph_obs:
+                    x = go["x"]  # [num_nodes, 5]
+                    ei = go["edge_index"]  # [2, num_edges]
+                    center = go["center_idx"]
+                    if x.shape[0] == 0:
+                        embeddings.append(torch.zeros(1, self.alpha_head[0].in_features,
+                                                       device=x.device if hasattr(x, 'device') else 'cpu'))
+                        continue
+                    node_embs = self.gnn_encoder(x, ei)  # [num_nodes, embed_dim]
+                    embeddings.append(node_embs[center].unsqueeze(0))
+                embedding = torch.cat(embeddings, dim=0)
+            else:
+                x = graph_obs["x"]
+                ei = graph_obs["edge_index"]
+                center = graph_obs["center_idx"]
+                node_embs = self.gnn_encoder(x, ei)
+                embedding = node_embs[center].unsqueeze(0)
+        else:
+            embedding = self.obs_encoder(obs)
 
-    def get_action_and_value(self, obs: torch.Tensor, action=None):
-        """Get action from policy and compute log probability."""
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        dist = Normal(mean, std)
+        alpha = F.softplus(self.alpha_head(embedding)) + 1.0
+        beta = F.softplus(self.beta_head(embedding)) + 1.0
+        return alpha, beta
+
+    def get_action_and_value(self, obs, action=None, action_mask=None,
+                              deterministic=False, graph_obs=None):
+        """Get a bounded action from policy and compute log probability."""
+        alpha, beta = self.forward(obs, graph_obs=graph_obs)
+        dist = Beta(alpha, beta)
 
         if action is None:
-            action = dist.sample()
-            action = torch.clamp(action, 0.0, 1.0)
+            if deterministic:
+                action = alpha / (alpha + beta)
+            else:
+                action = dist.rsample()
 
-        log_prob = dist.log_prob(action).sum(-1)
-        entropy = dist.entropy().sum(-1)
+        action = torch.clamp(action, 1e-6, 1.0 - 1e-6)
+        if action_mask is None:
+            valid_mask = torch.ones_like(action)
+        else:
+            valid_mask = action_mask.to(action.device).float()
+
+        # For masked (invalid) dims, use the Beta mean as a safe value
+        # to avoid NaN/Inf in log_prob that could corrupt gradients
+        safe_action = torch.where(
+            valid_mask > 0.5,
+            action,
+            (alpha / (alpha + beta)).detach(),
+        )
+        log_prob = (dist.log_prob(safe_action) * valid_mask).sum(-1)
+        entropy = (dist.entropy() * valid_mask).sum(-1)
+        action = action * valid_mask
 
         return action, log_prob, entropy
 
@@ -218,9 +275,11 @@ class GNNCritic(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim * num_agents, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1),
         )
 
