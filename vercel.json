@@ -1,6 +1,9 @@
 {
-  "routes": [
-    { "handle": "filesystem" },
-    { "rewrite": "/:path*", "to": "/dashboard/dist/:path*" }
+  "version": 2,
+  "builds": [
+    {
+      "src": "dashboard/dist/**",
+      "use": "@vercel/static"
+    }
   ]
 }
