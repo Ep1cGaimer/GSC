@@ -1,7 +1,6 @@
 {
-  "cleanUrls": true,
-  "trailingSlash": false,
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+  "routes": [
+    { "handle": "filesystem" },
+    { "rewrite": "/:path*", "to": "/dashboard/dist/:path*" }
   ]
 }
